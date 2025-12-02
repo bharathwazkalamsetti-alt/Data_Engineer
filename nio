@@ -1,8 +1,14 @@
+import uuid
 from pyspark.sql import Window
 from pyspark.sql.functions import col, when, sum as _sum, row_number, lit, current_timestamp
-import uuid
+
+# Loaded once after reading JSON
+cfg_root = ingestion_json["ICG_REM_TXN_SMRY_GIW_TRD_CITYKYC_GLOBAL"]
+segment_map = cfg_root["segment_map"]
+max_schema_cols = max(len(v["schema"]) for k, v in cfg_root.items() if k.startswith("SEG"))
 
 def apply_field_count(df, exp_count):
+    # Count non‑nulls across all columns and keep only rows matching exp_count
     cnt_expr = sum([when(col(f"c{i}").isNotNull(), 1).otherwise(0) for i in range(max_schema_cols)])
     return df.withColumn("field_count", cnt_expr).filter(col("field_count") == exp_count).drop("field_count")
 
@@ -13,9 +19,19 @@ def dedup_latest(df, keys, order_cols):
 def rollup(df, keys, sum_cols):
     return df.groupBy(keys).agg(*[_sum(col(c)).alias(c) for c in sum_cols])
 
-if df_raw.rdd.isEmpty():
-    print("No data rows found; nothing to load.")
-else:
+def merge_upsert(env, df, table, keys):
+    # Simple stub: replace with real MERGE if you need true upsert.
+    # For now, append only.
+    if df.rdd.isEmpty():
+        print(f"No rows to write for {table}")
+        return
+    write_to_oracle(env, df, table)
+
+def load_segments(df_raw, env, source_system):
+    if df_raw.rdd.isEmpty():
+        print("No data rows found; nothing to load.")
+        return
+
     for seg_code, seg_key in segment_map.items():
         seg_cfg = cfg_root.get(seg_key)
         if not seg_cfg:
@@ -29,27 +45,31 @@ else:
         rollup_keys  = seg_cfg.get("rollup_keys", dedup_keys)
         rollup_sums  = seg_cfg.get("rollup_sums", [c for c in schema_cols if c not in rollup_keys])
 
+        # Slice this segment; skip if none
         df_seg = df_raw.filter(col("c0") == seg_code)
         if df_seg.rdd.isEmpty():
             print(f"No rows for {seg_key} ({seg_code}); skipping.")
             continue
 
+        # Enforce field count
         df_seg = apply_field_count(df_seg, field_count)
-        if df_seg.rdd.isEmpty():
-            print(f"All rows dropped by field_count for {seg_key}; skipping.")
-            continue
 
-        # align to schema by position
+        # Align to named schema
         df_seg = df_seg.select([col(f"c{i}").alias(schema_cols[i]) for i in range(len(schema_cols))])
 
+        # Dedup latest per key
         if dedup_keys:
             df_seg = dedup_latest(df_seg, dedup_keys, dedup_order)
+
+        # Roll up measures
         if rollup_keys and rollup_sums:
             df_seg = rollup(df_seg, rollup_keys, rollup_sums)
+
+        # Filter out RGN FILTERED OUT
         if "load_status" in df_seg.columns:
             df_seg = df_seg.filter((col("load_status").isNull()) | (col("load_status") != "RGN FILTERED OUT"))
 
-        # add audit/meta columns
+        # Add audit/meta columns (append), then reorder to match table
         load_uuid = str(uuid.uuid4())
         df_seg = (
             df_seg
@@ -58,16 +78,14 @@ else:
             .withColumn("CREATE_DT", current_timestamp())
         )
 
-        # final column order: schema_cols plus audit cols at the end
+        # Reorder so JDBC matches table column order
         final_cols = schema_cols + ["BATCH_ID", "CREATE_ID", "CREATE_DT"]
         df_seg = df_seg.select([col(c) for c in final_cols])
 
-        # coalesce to reduce write overhead
-        df_seg = df_seg.coalesce(4)
+        # Optional: coalesce to fewer partitions before write to reduce overhead
+        # df_seg = df_seg.coalesce(4)
 
         print(f"Write to Target DB Table: {target_table}")
-        write_to_oracle(env, df_seg, target_table, merge_keys=dedup_keys)
-        print(f"Data successfully written to {target_table} in Oracle.")
-
+        merge_upsert(env, df_seg, target_table, dedup_keys)
         tgt_count = get_table_count(spark, env, target_table, source_system)
         print(f"Target Count for {target_table}: {int(tgt_count)}")
