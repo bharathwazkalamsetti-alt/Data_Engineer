@@ -1,197 +1,26 @@
-import json, datetime
-from pathlib import Path
-from pyspark.sql import SparkSession
-from pyspark.sql.functions import sha2, concat_ws
-from pyspark.sql.types import StructType, StructField, StringType
-from configs.config_file import fetch_config_params
-from configs.audit_file import insert_audit_log, update_audit_log
-from configs.hdfs_file_operations import copy_file_nas_to_hdfs
+from pyspark.sql import Window
+from pyspark.sql.functions import col, when, sum as _sum, row_number, lit, current_timestamp
+import uuid
 
-JSON_CONFIG_FILE = Path(__file__).parents[2] / "trades" / "config" / "ingestion_config.json"
+def apply_field_count(df, exp_count):
+    cnt_expr = sum([when(col(f"c{i}").isNotNull(), 1).otherwise(0) for i in range(max_schema_cols)])
+    return df.withColumn("field_count", cnt_expr).filter(col("field_count") == exp_count).drop("field_count")
 
-def init_spark(project_name, job_id, env):
-    return (SparkSession.builder.master("yarn")
-            .appName(f"{project_name}_{job_id}")
-            .config("spark.app.env", env)
-            .getOrCreate())
+def dedup_latest(df, keys, order_cols):
+    w = Window.partitionBy([col(k) for k in keys]).orderBy(*[col(c).desc() for c in order_cols])
+    return df.withColumn("rn", row_number().over(w)).filter(col("rn") == 1).drop("rn")
 
-def validate(spark, project_name, job_id, env):
-    start_time = datetime.datetime.now()
-    audit_id = None
-    source_count = 0
+def rollup(df, keys, sum_cols):
+    return df.groupBy(keys).agg(*[_sum(col(c)).alias(c) for c in sum_cols])
 
-    # load ingestion config to get max_schema_cols
-    with open(JSON_CONFIG_FILE) as f:
-        ingestion_json = json.load(f)
-    cfg_root = ingestion_json["ICG_REM_TXN_SMRY_GIW_TRD_CITYKYC_GLOBAL"]
-    max_schema_cols = max(len(v["schema"]) for k, v in cfg_root.items() if k.startswith("SEG"))
-
-    # job config
-    job_config_data = fetch_config_params(spark, project_name, job_id)
-    if not job_config_data:
-        raise Exception(f"No config found for job {job_id}")
-    row = job_config_data[0]
-    file_name = row.FILE_NAME
-    file_source_path = row.FILE_SOURCE_PATH
-    hdfs_file_load_path = row.HDFS_FILE_LOAD_PATH
-    field_separator = row.FIELD_SEPARATOR
-    source_system = row.SOURCE_SYSTEM
-    job_name = row.JOB_NAME
-
-    # copy file
-    _, actual_file_name, file_last_modified_time = copy_file_nas_to_hdfs(
-        spark, file_source_path, hdfs_file_load_path, file_name
-    )
-
-    # audit start
-    audit_id = insert_audit_log(
-        spark, project_name, job_id, job_name, source_system, actual_file_name,
-        file_last_modified_time, start_time
-    )
-
-    # optional file date from name
-    parts = actual_file_name.split('_')
-    file_date = (parts[8].replace('.dat', '').replace('.txt', '') if len(parts) > 8 else "UNKNOWN")
-
-    # read file
-    hdfs_path = f"{hdfs_file_load_path}/{file_name}*"
-    raw = spark.read.text(hdfs_path)
-    lines = raw.collect()
-    if len(lines) < 2:
-        raise Exception("File missing header/footer")
-    header = lines[0].value
-    footer = lines[-1].value
-    data_lines = lines[1:-1]
-
-    header_filedate = header.split(field_separator)[2][0:8]
-    footer_parts = footer.split(field_separator)
-    footer_count = int(footer_parts[1])
-    footer_chksum = int(footer_parts[2])
-
-    # normalize rows
-    parsed_rows = []
-    for r in data_lines:
-        parts = r.value.split(field_separator)
-        parts = [p if p != "" else None for p in parts]
-        if len(parts) < max_schema_cols:
-            parts += [None] * (max_schema_cols - len(parts))
-        elif len(parts) > max_schema_cols:
-            parts = parts[:max_schema_cols]
-        parsed_rows.append(parts)
-    schema = StructType([StructField(f"c{i}", StringType(), True) for i in range(max_schema_cols)])
-    df_raw = spark.createDataFrame(parsed_rows, schema=schema)
-    source_count = df_raw.count()
-
-    # checksum placeholder (replace if trailer uses different algo)
-    checksum_df = df_raw.withColumn("checksum", sha2(concat_ws("|", *df_raw.columns), 256))
-    final_checksum = checksum_df.selectExpr(
-        "sha2(concat_ws('|', collect_list(checksum)), 256) as final_checksum"
-    ).collect()[0]["final_checksum"]
-
-    file_date_match = (file_date == header_filedate)
-    row_count_match = (source_count == footer_count)
-    checksum_match = False  # set to (final_checksum == footer_chksum) if needed
-
-    audit_status = "PASSED" if (file_date_match and row_count_match and checksum_match) else "FAILED"
-    update_audit_log(spark, audit_id, audit_status, int(source_count), 0, start_time, detail="File validation completed")
-    if audit_status != "PASSED":
-        raise Exception("File validation failed")
-
-    # return context for load job (could be persisted instead)
-    return {
-        "file_name": file_name,
-        "file_source_path": file_source_path,
-        "hdfs_file_load_path": hdfs_file_load_path,
-        "field_separator": field_separator,
-        "cfg_root": cfg_root,
-        "max_schema_cols": max_schema_cols,
-        "source_system": source_system,
-        "env": env
-    }
-
-if __name__ == "__main__":
-    spark = init_spark("PUP-TRADE", "10", "dev")
-    ctx = validate(spark, "PUP-TRADE", "10", "dev")
-    # persist ctx if needed (e.g., save df_raw to parquet/temp table)
-    spark.stop()
-
-
-------
-
-import json
-from pathlib import Path
-from pyspark.sql import SparkSession, Window
-from pyspark.sql.functions import col, when, sum as _sum, row_number, lit
-from pyspark.sql.types import StructType, StructField, StringType
-
-from configs.config_file import fetch_config_params, get_table_count, add_audit_columns, get_oracle_conn_config
-from configs.hdfs_file_operations import copy_file_nas_to_hdfs  # if you re-read; otherwise skip
-# replace with your persistence if you saved df_raw from validation
-
-JSON_CONFIG_FILE = Path(__file__).parents[2] / "trades" / "config" / "ingestion_config.json"
-
-def init_spark(project_name, job_id, env):
-    return (SparkSession.builder.master("yarn")
-            .appName(f"{project_name}_{job_id}")
-            .config("spark.app.env", env)
-            .getOrCreate())
-
-def write_to_oracle(env, df, table, merge_keys=None):
-    if df.rdd.isEmpty():
-        print(f"No rows to write for {table}")
-        return
-    conn = get_oracle_conn_config(env)
-    (df.write.mode("append").format("jdbc")
-       .option("url", conn["url"])
-       .option("dbtable", table)
-       .option("user", conn["user"])
-       .option("password", conn["password"])
-       .option("driver", conn.get("driver", "oracle.jdbc.driver.OracleDriver"))
-       .save())
-
-def load(spark, context):
-    cfg_root = context["cfg_root"]
-    max_schema_cols = context["max_schema_cols"]
-    segment_map = cfg_root["segment_map"]
-    env = context["env"]
-    source_system = context["source_system"]
-
-    # In this example, re-read the file; if you saved df_raw from validation, load it instead
-    file_name = context["file_name"]; field_separator = context["field_separator"]; hdfs_file_load_path = context["hdfs_file_load_path"]
-    raw = spark.read.text(f"{hdfs_file_load_path}/{file_name}*")
-    lines = raw.collect()
-    data_lines = lines[1:-1]
-    parsed_rows = []
-    for r in data_lines:
-        parts = r.value.split(field_separator)
-        parts = [p if p != "" else None for p in parts]
-        if len(parts) < max_schema_cols:
-            parts += [None] * (max_schema_cols - len(parts))
-        elif len(parts) > max_schema_cols:
-            parts = parts[:max_schema_cols]
-        parsed_rows.append(parts)
-    schema = StructType([StructField(f"c{i}", StringType(), True) for i in range(max_schema_cols)])
-    df_raw = spark.createDataFrame(parsed_rows, schema=schema)
-
-    def apply_field_count(df, exp_count):
-        cnt_expr = sum([when(col(f"c{i}").isNotNull(), 1).otherwise(0) for i in range(max_schema_cols)])
-        return df.withColumn("field_count", cnt_expr).filter(col("field_count") == exp_count).drop("field_count")
-
-    def dedup_latest(df, keys, order_cols):
-        w = Window.partitionBy([col(k) for k in keys]).orderBy(*[col(c).desc() for c in order_cols])
-        return df.withColumn("rn", row_number().over(w)).filter(col("rn") == 1).drop("rn")
-
-    def rollup(df, keys, sum_cols):
-        return df.groupBy(keys).agg(*[_sum(col(c)).alias(c) for c in sum_cols])
-
-    if df_raw.rdd.isEmpty():
-        print("No data rows found; nothing to load.")
-        return
-
+if df_raw.rdd.isEmpty():
+    print("No data rows found; nothing to load.")
+else:
     for seg_code, seg_key in segment_map.items():
         seg_cfg = cfg_root.get(seg_key)
         if not seg_cfg:
             continue
+
         schema_cols  = seg_cfg["schema"]
         target_table = seg_cfg["target_table"]
         field_count  = seg_cfg["field_count"]
@@ -206,34 +35,39 @@ def load(spark, context):
             continue
 
         df_seg = apply_field_count(df_seg, field_count)
+        if df_seg.rdd.isEmpty():
+            print(f"All rows dropped by field_count for {seg_key}; skipping.")
+            continue
+
+        # align to schema by position
         df_seg = df_seg.select([col(f"c{i}").alias(schema_cols[i]) for i in range(len(schema_cols))])
+
         if dedup_keys:
             df_seg = dedup_latest(df_seg, dedup_keys, dedup_order)
         if rollup_keys and rollup_sums:
             df_seg = rollup(df_seg, rollup_keys, rollup_sums)
         if "load_status" in df_seg.columns:
             df_seg = df_seg.filter((col("load_status").isNull()) | (col("load_status") != "RGN FILTERED OUT"))
-        # Force ID_TYPE if needed:
-        # df_seg = df_seg.withColumn("ID_TYPE", lit("GFCID"))
 
-        df_seg = add_audit_columns(df_seg)
+        # add audit/meta columns
+        load_uuid = str(uuid.uuid4())
+        df_seg = (
+            df_seg
+            .withColumn("BATCH_ID", lit(load_uuid))
+            .withColumn("CREATE_ID", lit("PYSPARK"))
+            .withColumn("CREATE_DT", current_timestamp())
+        )
+
+        # final column order: schema_cols plus audit cols at the end
+        final_cols = schema_cols + ["BATCH_ID", "CREATE_ID", "CREATE_DT"]
+        df_seg = df_seg.select([col(c) for c in final_cols])
+
+        # coalesce to reduce write overhead
+        df_seg = df_seg.coalesce(4)
+
         print(f"Write to Target DB Table: {target_table}")
         write_to_oracle(env, df_seg, target_table, merge_keys=dedup_keys)
         print(f"Data successfully written to {target_table} in Oracle.")
+
         tgt_count = get_table_count(spark, env, target_table, source_system)
         print(f"Target Count for {target_table}: {int(tgt_count)}")
-
-if __name__ == "__main__":
-    spark = init_spark("PUP-TRADE", "10", "dev")
-    # In practice, load context from a persisted store or re-run validate to build it
-    ctx = {
-        "file_name": "your_file_name",         # fill from validate output
-        "hdfs_file_load_path": "your_hdfs_path",
-        "field_separator": "~",
-        "cfg_root": json.load(open(JSON_CONFIG_FILE))["ICG_REM_TXN_SMRY_GIW_TRD_CITYKYC_GLOBAL"],
-        "max_schema_cols": 52,  # or compute as above
-        "source_system": "your_source",
-        "env": "dev"
-    }
-    load(spark, ctx)
-    spark.stop()
