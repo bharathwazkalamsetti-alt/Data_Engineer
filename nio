@@ -1,52 +1,298 @@
-# 1) Slice by raw column name
-        df_seg = df_raw.filter(col("c0") == seg_code)
-        if df_seg.rdd.isEmpty():
-            print(f"No rows for {seg_key} ({seg_code}); skipping.")
-            continue
+import sys
+import uuid
+import json
+import datetime
+import os
+from pathlib import Path
+from pyspark.sql import SparkSession
+from pyspark.sql.functions import (
+    current_timestamp, lit, col, trim, lower, expr
+)
+from pyspark.sql.types import StructType, StructField, StringType
+from pyspark.storagelevel import StorageLevel
 
-        # 2) Enforce field count
-        df_seg = apply_field_count(df_seg, field_count)
+# Local helper imports (assumed to exist)
+from configs.config_file import (
+    fetch_config_params, get_table_count, add_audit_columns
+)
+from configs.audit_file import insert_audit_log, update_audit_log
+from configs.hdfs_file_operations import copy_file_nas_to_hdfs
+from trades.jobs.GIW_transforms import apply_field_count, dedup_latest, rollup
 
-        # 3) Rename/pad to schema BEFORE any dedup/rollup (use schema names from here on)
-        num_cols = len(df_seg.columns)
-        df_seg = df_seg.select([
-            col(f"c{i}").alias(schema_cols[i]) if i < num_cols else lit(None).alias(schema_cols[i])
-            for i in range(len(schema_cols))
-        ])
+# --------- Config ----------
+JSON_CONFIG_FILE = Path(_file_).parents[2] / "trades" / "config" / "GIW_ingestion_config.json"
 
-        # 4) Make sure all schema columns exist, then reorder to schema_cols
-        for c in schema_cols:
-            if c not in df_seg.columns:
-                df_seg = df_seg.withColumn(c, lit(None))
-        df_seg = df_seg.select(schema_cols)
+# --------- Spark init ----------
+def initialize_spark(project_name: str, job_id: str, env: str) -> SparkSession:
+    """
+    Initialize Spark session in a lightweight, production-friendly way.
+    """
+    builder = (
+        SparkSession.builder
+        .appName(f"{project_name}_{job_id}")
+        .config("spark.app.env", env)
+        .config("spark.sql.shuffle.partitions", "200")  # tune if needed
+    )
+    # keep master controlled by environment; only set it locally if not provided
+    return builder.getOrCreate()
 
-        # 5) Dedup latest per key
-        if dedup_keys:
-            df_seg = dedup_latest(df_seg, dedup_keys, dedup_order)
 
-        # 6) Roll up measures
-        if rollup_keys and rollup_sums:
-            df_seg = rollup(df_seg, rollup_keys, rollup_sums)
+# --------- File read & parse helpers ----------
+def read_file_header_footer_and_data(spark, hdfs_path_pattern, field_separator):
+    """
+    Read a text file into header, footer and RDD of data lines without collecting
+    the full dataset to driver. Returns (header_str, footer_str, data_rdd).
+    """
+    text_df = spark.read.text(hdfs_path_pattern)
+    text_rdd = text_df.rdd.map(lambda r: r.value)  # preserve order from underlying Hadoop split layout
 
-        # 7) Filter out RGN FILTERED OUT
-        if "load_status" in df_seg.columns:
-            df_seg = df_seg.filter((col("load_status").isNull()) | (col("load_status") != "RGN FILTERED OUT"))
+    # zipWithIndex preserves order and lets us find first/last without bringing all rows to driver
+    zipped = text_rdd.zipWithIndex().map(lambda v_idx: (v_idx[1], v_idx[0]))  # index, value
 
-        # 8) Add audit/meta columns
-        load_uuid = str(uuid.uuid4())
-        df_seg = (
-            df_seg
-            .withColumn("BATCH_ID", lit(load_uuid))
-            .withColumn("CREATE_ID", lit("PYSPARK"))
-            .withColumn("CREATE_DT", current_timestamp())
-        )
+    total_rows = zipped.count()  # single action
+    if total_rows < 2:
+        raise ValueError("File has fewer than 2 lines (header/footer expected).")
 
-        # 9) Final reorder to match table
-        final_cols = schema_cols + ["BATCH_ID", "CREATE_ID", "CREATE_DT"]
-        df_seg = df_seg.select([col(c) for c in final_cols])
+    header = zipped.filter(lambda iv: iv[0] == 0).map(lambda iv: iv[1]).first()
+    footer = zipped.filter(lambda iv: iv[0] == total_rows - 1).map(lambda iv: iv[1]).first()
 
-        # 10) Write
-        print(f"Write to Target DB Table: {target_table}")
-        write_to_oracle(env, df_seg, target_table)
-        tgt_count = get_table_count(spark, env, target_table, source_system)
-        print(f"Target Count for {target_table}: {int(tgt_count)}")
+    # data lines are indexes 1 .. total_rows-2
+    data_rdd = zipped.filter(lambda iv: 0 < iv[0] < total_rows - 1).map(lambda iv: iv[1])
+
+    return header, footer, data_rdd, total_rows
+
+
+def data_rdd_to_wide_df(spark, data_rdd, field_separator, max_schema_cols):
+    """
+    Convert RDD of delimited strings to a wide Spark DataFrame with columns c0..cN-1.
+    Does not collect to driver.
+    """
+    def split_and_pad(line):
+        parts = line.split(field_separator)
+        # pad/truncate to max_schema_cols
+        if len(parts) < max_schema_cols:
+            parts = parts + [None] * (max_schema_cols - len(parts))
+        else:
+            parts = parts[:max_schema_cols]
+        return parts
+
+    rows_rdd = data_rdd.map(split_and_pad)
+    schema = StructType([StructField(f"c{i}", StringType(), True) for i in range(max_schema_cols)])
+    return spark.createDataFrame(rows_rdd, schema=schema)
+
+
+# --------- Segment processing ----------
+def process_segment(
+    spark,
+    df_raw_wide,
+    seg_code,
+    seg_cfg,
+    max_schema_cols,
+    dedup_latest_fn,
+    rollup_fn
+):
+    """
+    Process one segment: filter rows, enforce field count, map to schema cols,
+    dedupe, rollup, add audit columns, return final df ready for write.
+    """
+    schema_cols = seg_cfg["schema"]
+    field_count = seg_cfg["field_count"]
+    dedup_keys = seg_cfg.get("dedup_keys", [])
+    dedup_order = seg_cfg.get("dedup_order", ["LST_UPD_DT", "LST_UPD_TIME"])
+    rollup_keys = seg_cfg.get("rollup_keys", dedup_keys)
+    rollup_sums = seg_cfg.get("rollup_sums", [c for c in schema_cols if c not in rollup_keys])
+
+    # Filter by segment code in c0
+    df_seg = df_raw_wide.filter(col("c0") == seg_code)
+
+    if df_seg.rdd.isEmpty():
+        return None  # nothing to do for this segment
+
+    # ensure field count per row (apply_field_count assumed to operate like before)
+    df_seg = apply_field_count(df_seg, field_count, max_schema_cols)
+
+    # Map columns c0.. to schema column names. When column index not present, set None
+    # Use number of columns in df_seg to avoid indexing beyond available
+    num_cols = len(df_seg.columns)
+    select_exprs = [
+        col(f"c{i}").alias(schema_cols[i]) if i < num_cols else lit(None).alias(schema_cols[i])
+        for i in range(len(schema_cols))
+    ]
+    df_seg = df_seg.select(*select_exprs)
+
+    # Ensure all expected schema columns exist
+    for c in schema_cols:
+        if c not in df_seg.columns:
+            df_seg = df_seg.withColumn(c, lit(None))
+    df_seg = df_seg.select(schema_cols)
+
+    # Dedup if required
+    if dedup_keys:
+        df_seg = dedup_latest_fn(df_seg, dedup_keys, dedup_order)
+
+    # Rollup sums if required
+    if rollup_keys and rollup_sums:
+        df_seg = rollup_fn(df_seg, rollup_keys, rollup_sums)
+
+    # Exclude rows filtered by load_status if column exists
+    if "load_status" in df_seg.columns:
+        df_seg = df_seg.filter((col("load_status").isNull()) | (col("load_status") != "RGN FILTERED OUT"))
+
+    # Finalize columns & add batch metadata
+    load_uuid = str(uuid.uuid4())
+    df_seg = (
+        df_seg
+        .withColumn("BATCH_ID", lit(load_uuid))
+        .withColumn("CREATE_ID", lit("PYSPARK"))
+        .withColumn("CREATE_DT", current_timestamp())
+    )
+
+    return df_seg
+
+
+# --------- Main ----------
+def main():
+    project_name = "PUP-TRADE"
+    job_id = "10"
+    env = "dev"
+
+    spark = initialize_spark(project_name, job_id, env)
+    print(f"JSON Config File Path: {JSON_CONFIG_FILE}")
+
+    start_time = datetime.datetime.now()
+
+    try:
+        # Load job config rows from DB
+        job_config_rows = fetch_config_params(spark, project_name, job_id)
+        if not job_config_rows:
+            print(f"No config found for job {job_id}")
+            return
+
+        # We expect one config row per job, iterate for safety
+        for cfg_row in job_config_rows:
+            project_name = cfg_row.PROJECT_NAME
+            job_id = cfg_row.JOB_ID
+            job_name = cfg_row.JOB_NAME
+            file_name = cfg_row.FILE_NAME
+            file_source_path = cfg_row.FILE_SOURCE_PATH
+            hdfs_file_load_path = cfg_row.HDFS_FILE_LOAD_PATH
+            file_archive_path = cfg_row.FILE_ARCHIVE_PATH
+            field_separator = cfg_row.FIELD_SEPARATOR
+            target_connection_name = cfg_row.TARGET_CONNECTION_NAME
+
+            # copy file from NAS -> HDFS
+            complete_local_file_path, actual_file_name, file_last_modified_time = copy_file_nas_to_hdfs(
+                spark, file_source_path, hdfs_file_load_path, file_name
+            )
+
+            audit_id = insert_audit_log(
+                spark, project_name, job_id, job_name, cfg_row.SOURCE_SYSTEM,
+                actual_file_name, file_last_modified_time, start_time
+            )
+
+            # extract file_date from filename if present
+            file_name_parts = actual_file_name.split("_")
+            if len(file_name_parts) > 8:
+                file_date = file_name_parts[8].replace(".dat", "").replace(".txt", "")
+            else:
+                file_date = "UNKNOWN"
+
+            # Read header/footer and data RDD (avoid collect)
+            hdfs_pattern = f"{hdfs_file_load_path}/{file_name}*"
+            header, footer, data_rdd, total_rows = read_file_header_footer_and_data(spark, hdfs_pattern, field_separator)
+
+            # parse header/footer fields
+            header_parts = header.split(field_separator)
+            header_filedate = header_parts[2][0:8] if len(header_parts) > 2 else "UNKNOWN"
+
+            footer_parts = footer.split(field_separator)
+            footer_count = int(footer_parts[1]) if len(footer_parts) > 1 and footer_parts[1].isdigit() else None
+            footer_chksum = int(footer_parts[2]) if len(footer_parts) > 2 and footer_parts[2].isdigit() else None
+
+            # Load JSON config for segments once; broadcast small maps for joins
+            with open(JSON_CONFIG_FILE) as f:
+                full_cfg = json.load(f)
+
+            cfg_root = full_cfg.get("ICG_REM_TXN_SMRy_GIW_IRD_CITYKYC_GLOBAL") or full_cfg.get("ICG_REM_TXN_SMRY_GIW_TRD_CITYKYC_GLOBAL")
+            if cfg_root is None:
+                raise KeyError("Segment root not found in JSON config")
+
+            segment_map = cfg_root["segment_map"]
+            # determine max schema cols
+            max_schema_cols = max(len(cfg_root[k]["schema"]) for k in cfg_root.keys() if k.startswith("SEG"))
+
+            # convert data_rdd to a wide DF
+            df_raw_wide = data_rdd_to_wide_df(spark, data_rdd, field_separator, max_schema_cols)
+            df_raw_wide = df_raw_wide.persist(StorageLevel.MEMORY_AND_DISK)
+
+            # source count (number of data rows)
+            source_count = df_raw_wide.count()
+            print(f"Source DataFrame Count: {source_count}")
+
+            # validation checks
+            file_date_match = (file_date == header_filedate)
+            row_count_match = (footer_count is not None and source_count == footer_count)
+
+            audit_status = "PASSED" if (file_date_match and row_count_match) else "FAILED"
+            update_audit_log(spark, audit_id, audit_status, int(source_count), 0, start_time, detail="File validation completed")
+
+            if not (file_date_match and row_count_match):
+                print(f"Validation failed: file_date_match={file_date_match}, row_count_match={row_count_match}")
+                return
+
+            print("File validation passed. Processing segments...")
+
+            # Process each segment defined in segment_map
+            for seg_code, seg_key in segment_map.items():
+                seg_cfg = cfg_root.get(seg_key)
+                if not seg_cfg:
+                    print(f"No segment config for {seg_key}; skipping.")
+                    continue
+
+                df_seg_final = process_segment(
+                    spark,
+                    df_raw_wide,
+                    seg_code,
+                    seg_cfg,
+                    max_schema_cols,
+                    dedup_latest,
+                    rollup
+                )
+
+                if df_seg_final is None:
+                    print(f"No rows to load for segment {seg_key} ({seg_code}); skipping write.")
+                    continue
+
+                # Write to target (Oracle) using JDBC with minimal options
+                target_table = seg_cfg["target_table"]
+                oracle_url = "jdbc:oracle:thin:@//NAKYX1D.oraas.dyn.nssroot.net:8889/HANAKYX1D"
+                user = "KYCX_REF_DS_ETL"
+                password = os.environ.get("DEV_ORACLE_PASSWORD")
+
+                # Optionally repartition to improve parallel writes (tune numPartitions as needed)
+                df_to_write = df_seg_final.repartition(10)
+
+                df_to_write.write \
+                    .format("jdbc") \
+                    .option("url", oracle_url) \
+                    .option("dbtable", target_table) \
+                    .option("user", user) \
+                    .option("password", password) \
+                    .option("driver", "oracle.jdbc.OracleDriver") \
+                    .option("batchsize", "1000") \
+                    .mode("append") \
+                    .save()
+
+                target_cnt = get_table_count(spark, env, target_table)
+                print(f"Wrote segment '{seg_key}' to {target_table}. Target count now: {int(target_cnt)}")
+
+            # cleanup
+            df_raw_wide.unpersist()
+
+    except Exception as ex:
+        print(f"Error occurred: {ex}")
+        raise
+
+
+if _name_ == "_main_":
+    main()
