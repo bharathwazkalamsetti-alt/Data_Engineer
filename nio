@@ -5,16 +5,12 @@ import datetime
 import os
 from pathlib import Path
 from pyspark.sql import SparkSession
-from pyspark.sql.functions import (
-    current_timestamp, lit, col, trim, lower, expr
-)
+from pyspark.sql.functions import current_timestamp, lit, col
 from pyspark.sql.types import StructType, StructField, StringType
 from pyspark.storagelevel import StorageLevel
 
 # Local helper imports (assumed to exist)
-from configs.config_file import (
-    fetch_config_params, get_table_count, add_audit_columns
-)
+from configs.config_file import fetch_config_params, get_table_count
 from configs.audit_file import insert_audit_log, update_audit_log
 from configs.hdfs_file_operations import copy_file_nas_to_hdfs
 from trades.jobs.GIW_transforms import apply_field_count, dedup_latest, rollup
@@ -25,15 +21,18 @@ JSON_CONFIG_FILE = Path(_file_).parents[2] / "trades" / "config" / "GIW_ingestio
 # --------- Spark init ----------
 def initialize_spark(project_name: str, job_id: str, env: str) -> SparkSession:
     """
-    Initialize Spark session in a lightweight, production-friendly way.
+    Initialize Spark session. Adjust memory configs for your environment if necessary.
     """
     builder = (
         SparkSession.builder
         .appName(f"{project_name}_{job_id}")
         .config("spark.app.env", env)
-        .config("spark.sql.shuffle.partitions", "200")  # tune if needed
+        # Uncomment / tune these if you control executor/driver memory from the job:
+        # .config("spark.executor.memory", "8g")
+        # .config("spark.driver.memory", "4g")
+        # .config("spark.executor.memoryOverhead", "2g")
+        .config("spark.sql.shuffle.partitions", "200")  # tune to cluster size
     )
-    # keep master controlled by environment; only set it locally if not provided
     return builder.getOrCreate()
 
 
@@ -44,19 +43,19 @@ def read_file_header_footer_and_data(spark, hdfs_path_pattern, field_separator):
     the full dataset to driver. Returns (header_str, footer_str, data_rdd).
     """
     text_df = spark.read.text(hdfs_path_pattern)
-    text_rdd = text_df.rdd.map(lambda r: r.value)  # preserve order from underlying Hadoop split layout
-
-    # zipWithIndex preserves order and lets us find first/last without bringing all rows to driver
-    zipped = text_rdd.zipWithIndex().map(lambda v_idx: (v_idx[1], v_idx[0]))  # index, value
-
-    total_rows = zipped.count()  # single action
+    # count total rows (single action); faster than expensive collect
+    total_rows = text_df.count()
     if total_rows < 2:
         raise ValueError("File has fewer than 2 lines (header/footer expected).")
 
-    header = zipped.filter(lambda iv: iv[0] == 0).map(lambda iv: iv[1]).first()
-    footer = zipped.filter(lambda iv: iv[0] == total_rows - 1).map(lambda iv: iv[1]).first()
+    # header and footer as strings
+    header = text_df.take(1)[0].value
+    footer = text_df.tail(1)[0].value  # tail reads only last partition's last row; ok in typical setups
 
-    # data lines are indexes 1 .. total_rows-2
+    # data rows DF (excluding header/footer)
+    # Use rdd.map to get lines and drop first/last by index to avoid collecting all
+    text_rdd = text_df.rdd.map(lambda r: r.value)
+    zipped = text_rdd.zipWithIndex().map(lambda v_idx: (v_idx[1], v_idx[0]))  # (index, line)
     data_rdd = zipped.filter(lambda iv: 0 < iv[0] < total_rows - 1).map(lambda iv: iv[1])
 
     return header, footer, data_rdd, total_rows
@@ -65,7 +64,6 @@ def read_file_header_footer_and_data(spark, hdfs_path_pattern, field_separator):
 def data_rdd_to_wide_df(spark, data_rdd, field_separator, max_schema_cols):
     """
     Convert RDD of delimited strings to a wide Spark DataFrame with columns c0..cN-1.
-    Does not collect to driver.
     """
     def split_and_pad(line):
         parts = line.split(field_separator)
@@ -83,7 +81,6 @@ def data_rdd_to_wide_df(spark, data_rdd, field_separator, max_schema_cols):
 
 # --------- Segment processing ----------
 def process_segment(
-    spark,
     df_raw_wide,
     seg_code,
     seg_cfg,
@@ -105,14 +102,14 @@ def process_segment(
     # Filter by segment code in c0
     df_seg = df_raw_wide.filter(col("c0") == seg_code)
 
-    if df_seg.rdd.isEmpty():
-        return None  # nothing to do for this segment
+    # cheap empty check
+    if df_seg.limit(1).count() == 0:
+        return None
 
-    # ensure field count per row (apply_field_count assumed to operate like before)
+    # Field count enforcement
     df_seg = apply_field_count(df_seg, field_count, max_schema_cols)
 
-    # Map columns c0.. to schema column names. When column index not present, set None
-    # Use number of columns in df_seg to avoid indexing beyond available
+    # Map c* columns to schema columns
     num_cols = len(df_seg.columns)
     select_exprs = [
         col(f"c{i}").alias(schema_cols[i]) if i < num_cols else lit(None).alias(schema_cols[i])
@@ -138,7 +135,7 @@ def process_segment(
     if "load_status" in df_seg.columns:
         df_seg = df_seg.filter((col("load_status").isNull()) | (col("load_status") != "RGN FILTERED OUT"))
 
-    # Finalize columns & add batch metadata
+    # Add batch metadata
     load_uuid = str(uuid.uuid4())
     df_seg = (
         df_seg
@@ -168,7 +165,6 @@ def main():
             print(f"No config found for job {job_id}")
             return
 
-        # We expect one config row per job, iterate for safety
         for cfg_row in job_config_rows:
             project_name = cfg_row.PROJECT_NAME
             job_id = cfg_row.JOB_ID
@@ -209,20 +205,21 @@ def main():
             footer_count = int(footer_parts[1]) if len(footer_parts) > 1 and footer_parts[1].isdigit() else None
             footer_chksum = int(footer_parts[2]) if len(footer_parts) > 2 and footer_parts[2].isdigit() else None
 
-            # Load JSON config for segments once; broadcast small maps for joins
+            # Load JSON config for segments once
             with open(JSON_CONFIG_FILE) as f:
                 full_cfg = json.load(f)
 
+            # try both possible root keys (backwards compatibility)
             cfg_root = full_cfg.get("ICG_REM_TXN_SMRy_GIW_IRD_CITYKYC_GLOBAL") or full_cfg.get("ICG_REM_TXN_SMRY_GIW_TRD_CITYKYC_GLOBAL")
             if cfg_root is None:
                 raise KeyError("Segment root not found in JSON config")
 
             segment_map = cfg_root["segment_map"]
-            # determine max schema cols
             max_schema_cols = max(len(cfg_root[k]["schema"]) for k in cfg_root.keys() if k.startswith("SEG"))
 
-            # convert data_rdd to a wide DF
+            # convert data_rdd to a wide DF (persist to free only if reused)
             df_raw_wide = data_rdd_to_wide_df(spark, data_rdd, field_separator, max_schema_cols)
+            # persist only if data reused across segments and too big to recompute cheaply
             df_raw_wide = df_raw_wide.persist(StorageLevel.MEMORY_AND_DISK)
 
             # source count (number of data rows)
@@ -238,9 +235,18 @@ def main():
 
             if not (file_date_match and row_count_match):
                 print(f"Validation failed: file_date_match={file_date_match}, row_count_match={row_count_match}")
+                # cleanup
+                df_raw_wide.unpersist()
                 return
 
             print("File validation passed. Processing segments...")
+
+            # JDBC connection details (keep secrets in env)
+            oracle_url = "jdbc:oracle:thin:@//NAKYX1D.oraas.dyn.nssroot.net:8889/HANAKYX1D"
+            user = "KYCX_REF_DS_ETL"
+            password = os.environ.get("DEV_ORACLE_PASSWORD")
+            if not password:
+                raise EnvironmentError("DEV_ORACLE_PASSWORD not found in environment")
 
             # Process each segment defined in segment_map
             for seg_code, seg_key in segment_map.items():
@@ -250,7 +256,6 @@ def main():
                     continue
 
                 df_seg_final = process_segment(
-                    spark,
                     df_raw_wide,
                     seg_code,
                     seg_cfg,
@@ -263,30 +268,38 @@ def main():
                     print(f"No rows to load for segment {seg_key} ({seg_code}); skipping write.")
                     continue
 
-                # Write to target (Oracle) using JDBC with minimal options
-                target_table = seg_cfg["target_table"]
-                oracle_url = "jdbc:oracle:thin:@//NAKYX1D.oraas.dyn.nssroot.net:8889/HANAKYX1D"
-                user = "KYCX_REF_DS_ETL"
-                password = os.environ.get("DEV_ORACLE_PASSWORD")
+                # Reduce partitions instead of full shuffle; safe small parallelism for JDBC
+                current_parts = df_seg_final.rdd.getNumPartitions()
+                target_parts = min(4, max(1, current_parts))  # tune target from 1..4
+                df_to_write = df_seg_final.coalesce(target_parts)
 
-                # Optionally repartition to improve parallel writes (tune numPartitions as needed)
-                df_to_write = df_seg_final.repartition(10)
-
+                # JDBC write tuned to reduce memory pressure
                 df_to_write.write \
                     .format("jdbc") \
                     .option("url", oracle_url) \
-                    .option("dbtable", target_table) \
+                    .option("dbtable", seg_cfg["target_table"]) \
                     .option("user", user) \
                     .option("password", password) \
                     .option("driver", "oracle.jdbc.OracleDriver") \
-                    .option("batchsize", "1000") \
+                    .option("batchsize", "500") \
                     .mode("append") \
                     .save()
 
-                target_cnt = get_table_count(spark, env, target_table)
-                print(f"Wrote segment '{seg_key}' to {target_table}. Target count now: {int(target_cnt)}")
+                # optional target count/confirm
+                try:
+                    target_cnt = get_table_count(spark, env, seg_cfg["target_table"])
+                    print(f"Wrote segment '{seg_key}' to {seg_cfg['target_table']}. Target count now: {int(target_cnt)}")
+                except Exception:
+                    # if counting target table is expensive or fails, ignore but log
+                    print(f"Wrote segment '{seg_key}' to {seg_cfg['target_table']}. (target count check failed)")
 
-            # cleanup
+                # free memory of segment DF if persisted internally by transformations
+                try:
+                    df_to_write.unpersist()
+                except Exception:
+                    pass
+
+            # cleanup raw df
             df_raw_wide.unpersist()
 
     except Exception as ex:
